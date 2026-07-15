@@ -1,0 +1,225 @@
+name: Build Debian Packages
+
+on:
+  schedule:
+    - cron: "3 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: MHSanaei/3x-ui
+
+jobs:
+  # ── Resolve version ────────────────────────────────────────────────────
+  # Compare upstream latest release with this repo's; build when different.
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Poll upstream latest release
+          UPSTREAM=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          UPSTREAM_TAG=$(echo "${UPSTREAM}" | jq -r '.tag_name')
+
+          if [ -z "${UPSTREAM_TAG}" ] || [ "${UPSTREAM_TAG}" = "null" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Failed to fetch upstream release"
+            exit 0
+          fi
+
+          # Compare with this repo's latest release
+          THIS=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          THIS_TAG=$(echo "${THIS}" | jq -r '.tag_name // ""')
+
+          echo "upstream=${UPSTREAM_TAG}  this=${THIS_TAG}"
+
+          if [ "${UPSTREAM_TAG}" = "${THIS_TAG}" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Already up-to-date"
+          else
+            echo "build=true"               >> "$GITHUB_OUTPUT"
+            echo "tag=${UPSTREAM_TAG}"      >> "$GITHUB_OUTPUT"
+            echo "version=${UPSTREAM_TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "New upstream release → ${UPSTREAM_TAG}"
+          fi
+
+  # ── Build debs (one job per architecture) ─────────────────────────────
+  build-deb:
+    name: Build deb (${{ matrix.debarch }})
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goarch: amd64
+            debarch: amd64
+          - goarch: arm64
+            debarch: arm64
+          - goarch: arm
+            goarm: "7"
+            debarch: armhf
+          - goarch: "386"
+            debarch: i386
+
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Build frontend
+        run: |
+          if [ -d "web" ]; then
+            cd web
+          elif [ -d "frontend" ]; then
+            cd frontend
+          else
+            echo "No frontend directory found"
+            exit 1
+          fi
+          npm install
+          npm run build
+          # Copy dist to internal/web/dist for Go embed
+          if [ -d "dist" ] && [ -d "../internal/web" ]; then
+            mkdir -p ../internal/web/dist
+            cp -r dist/* ../internal/web/dist/
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Compile
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          go build -trimpath -ldflags "-s -w" -o x-ui ./main.go
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DEBARCH: ${{ matrix.debarch }}
+        run: |
+          set -euo pipefail
+
+          PKG="3x-ui_${VERSION}_${DEBARCH}"
+          mkdir -p "${PKG}/DEBIAN" \
+                   "${PKG}/usr/bin" \
+                   "${PKG}/etc/x-ui" \
+                   "${PKG}/lib/systemd/system" \
+                   "${PKG}/usr/share/doc/3x-ui"
+
+          cp x-ui "${PKG}/usr/bin/x-ui"
+          chmod 755 "${PKG}/usr/bin/x-ui"
+          cp LICENSE "${PKG}/usr/share/doc/3x-ui/copyright"
+
+          cat > "${PKG}/lib/systemd/system/x-ui.service" <<'SVC'
+          [Unit]
+          Description=3x-ui Xray Panel
+          After=network.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/x-ui
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+
+          cat > "${PKG}/DEBIAN/prerm" <<'PRERM'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "remove" ]; then
+            systemctl stop x-ui 2>/dev/null || true
+            systemctl disable x-ui 2>/dev/null || true
+          fi
+          PRERM
+          chmod 755 "${PKG}/DEBIAN/prerm"
+
+          cat > "${PKG}/DEBIAN/control" <<CTRL
+          Package: 3x-ui
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: ${DEBARCH}
+          Maintainer: MHSanaei <https://github.com/MHSanaei>
+          Description: Xray panel with multi-protocol and multi-user support.
+           3x-ui is a web-based panel for managing Xray proxies,
+           supporting Vmess, Vless, Trojan, and other protocols.
+          Homepage: https://github.com/MHSanaei/3x-ui
+          CTRL
+
+          dpkg-deb --build "${PKG}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ needs.resolve.outputs.version }}-${{ matrix.debarch }}
+          path: "*.deb"
+
+  # ── Publish release ───────────────────────────────────────────────────
+  publish:
+    name: Publish release
+    needs: [resolve, build-deb]
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Download all debs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: debs-${{ needs.resolve.outputs.version }}-*
+          merge-multiple: true
+          path: debs
+
+      - name: Download upstream source tarball
+        run: |
+          TAG="${{ needs.resolve.outputs.tag }}"
+          URL="https://github.com/${{ env.UPSTREAM_REPO }}/archive/refs/tags/${TAG}.tar.gz"
+          curl -sSL -o "3x-ui-${TAG}-source.tar.gz" "${URL}"
+          echo "Downloaded source: $(du -h "3x-ui-${TAG}-source.tar.gz" | cut -f1)"
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          body: |
+            Automated build of `https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ needs.resolve.outputs.tag }}`.
+
+            Includes `.deb` packages for **3x-ui** on amd64, arm64, armhf, and i386.
+          files: |
+            debs/*.deb
+            3x-ui-*-source.tar.gz
+          fail_on_unmatched_files: false
