@@ -66,24 +66,28 @@ jobs:
         include:
           - goarch: amd64
             debarch: amd64
+            xray_asset: linux-64
           - goarch: arm64
             debarch: arm64
+            xray_asset: linux-arm64-v8a
           - goarch: arm
             goarm: "7"
             debarch: armhf
+            xray_asset: linux-arm32-v7a
           - goarch: "386"
             debarch: i386
+            xray_asset: linux-32
 
     steps:
       - name: Checkout upstream
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ needs.resolve.outputs.tag }}
           fetch-depth: 1
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -105,39 +109,92 @@ jobs:
             cp -r dist/* ../internal/web/dist/
           fi
 
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-i686-linux-gnu
+
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
 
       - name: Compile
         env:
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "1"
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
+          case "${GOARCH}" in
+            arm64) export CC=aarch64-linux-gnu-gcc ;;
+            arm)   export CC=arm-linux-gnueabihf-gcc ;;
+            386)   export CC=i686-linux-gnu-gcc ;;
+          esac
           go build -trimpath -ldflags "-s -w" -o x-ui ./main.go
+
+      - name: Download dependencies
+        env:
+          XRAY_ASSET: ${{ matrix.xray_asset }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+
+          # Xray core
+          XRAY_TAG=$(curl -sS "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
+            | jq -r '.tag_name')
+          echo "Xray version: ${XRAY_TAG}"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 -o xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_TAG}/Xray-${XRAY_ASSET}.zip"
+          unzip -j xray.zip xray
+          rm -f geoip.dat geosite.dat
+          mv xray "xray-linux-${GOARCH}"
+          chmod 755 "xray-linux-${GOARCH}"
+
+          # Geo data files (same sources as official 3x-ui)
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geoip.dat   "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geoip_IR.dat   "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geosite_IR.dat "https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geoip_RU.dat   "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat"
+          curl -sSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o geosite_RU.dat "https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat"
 
       - name: Package
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
           DEBARCH: ${{ matrix.debarch }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           set -euo pipefail
 
           PKG="3x-ui_${VERSION}_${DEBARCH}"
           mkdir -p "${PKG}/DEBIAN" \
                    "${PKG}/usr/bin" \
-                   "${PKG}/etc/x-ui" \
+                   "${PKG}/usr/local/x-ui/bin" \
                    "${PKG}/lib/systemd/system" \
                    "${PKG}/usr/share/doc/3x-ui"
 
+          # Binaries
           cp x-ui "${PKG}/usr/bin/x-ui"
           chmod 755 "${PKG}/usr/bin/x-ui"
+          cp "xray-linux-${GOARCH}" "${PKG}/usr/local/x-ui/bin/xray-linux-${GOARCH}"
+          chmod 755 "${PKG}/usr/local/x-ui/bin/xray-linux-${GOARCH}"
+
+          # Geo data
+          cp geoip.dat geosite.dat geoip_IR.dat geosite_IR.dat geoip_RU.dat geosite_RU.dat \
+            "${PKG}/usr/local/x-ui/bin/"
+
+          # Docs
           cp LICENSE "${PKG}/usr/share/doc/3x-ui/copyright"
 
+          # Systemd service
           cat > "${PKG}/lib/systemd/system/x-ui.service" <<'SVC'
           [Unit]
           Description=3x-ui Xray Panel
@@ -145,6 +202,7 @@ jobs:
 
           [Service]
           Type=simple
+          WorkingDirectory=/usr/local/x-ui
           ExecStart=/usr/bin/x-ui
           Restart=on-failure
           RestartSec=5
@@ -153,6 +211,7 @@ jobs:
           WantedBy=multi-user.target
           SVC
 
+          # prerm — stop service on uninstall
           cat > "${PKG}/DEBIAN/prerm" <<'PRERM'
           #!/bin/sh
           set -e
@@ -163,6 +222,19 @@ jobs:
           PRERM
           chmod 755 "${PKG}/DEBIAN/prerm"
 
+          # postinst — ensure dirs and permissions
+          cat > "${PKG}/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "configure" ]; then
+            mkdir -p /usr/local/x-ui/bin
+            chmod 755 /usr/local/x-ui /usr/local/x-ui/bin
+            chown -R root:root /usr/local/x-ui
+          fi
+          POSTINST
+          chmod 755 "${PKG}/DEBIAN/postinst"
+
+          # control
           cat > "${PKG}/DEBIAN/control" <<CTRL
           Package: 3x-ui
           Version: ${VERSION}
@@ -179,7 +251,7 @@ jobs:
           dpkg-deb --build "${PKG}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debs-${{ needs.resolve.outputs.version }}-${{ matrix.debarch }}
           path: "*.deb"
@@ -192,12 +264,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
       - name: Download all debs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: debs-${{ needs.resolve.outputs.version }}-*
           merge-multiple: true
@@ -211,7 +283,7 @@ jobs:
           echo "Downloaded source: $(du -h "3x-ui-${TAG}-source.tar.gz" | cut -f1)"
 
       - name: Create / update release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           name: ${{ needs.resolve.outputs.tag }}
